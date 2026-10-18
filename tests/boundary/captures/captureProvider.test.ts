@@ -11,6 +11,9 @@ import { PrivateRuntimeRoot } from "../../../src/process/PrivateRuntimeRoot.js";
 import { spawnOwnedProviderProcess } from "../../../src/process/ProviderProcess.js";
 import { createTestTempDirectory } from "../../fixtures/temporaryDirectory.js";
 import { createDeferred } from "../../fixtures/binarySession.js";
+import { Cli } from "incur";
+import { registerCaptureCommands } from "../../../src/cli/captureCommands.js";
+import { silentLogger } from "../../../src/logger.js";
 
 // A command-boundary simulator: real process ownership/filesystem, not real TShark coverage.
 const fixture = async (mode = "ok", failCleanup = false) => {
@@ -50,6 +53,8 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
     },
     async (input) => {
       calls++;
+      if (mode === "launch-failure" && !input.arguments.includes("--version"))
+        throw Object.assign(new Error("spawn E2BIG"), { code: "E2BIG" });
       if (mode === "file-limit" && !input.arguments.includes("--version")) {
         const stdout = { text: "", bytes: 0, observedBytes: 0 };
         const stderr = {
@@ -92,6 +97,8 @@ else { if(readFileSync('capture', 'utf8') !== 'recording bytes') throw Error('wr
       return {
         path: root.path,
         close: async () => {
+          if (mode === "close-abort")
+            controller.abort({ request: "cancel during workspace close" });
           if (!mayClean) throw new Error("cleanup fixture failure");
           await root.close();
         },
@@ -243,12 +250,29 @@ it.each([
     );
     if (result.ok) throw new Error("Expected capture analysis failure");
     expect(result.error._tag).toBe(tag);
+    if (mode === "wait")
+      expect(result.error.cause).toBe(f.controller.signal.reason);
     expect(result.error.cleanupIncomplete).toBe(false);
     expect(
       (await readdir(f.directory)).filter((name) =>
         name.startsWith("decoder-"),
       ),
     ).toEqual([]);
+  },
+);
+
+it.each(["capture", "fields"] as const)(
+  "does not attribute the version probe's output to a %s command that fails to launch",
+  async (operation) => {
+    const f = await fixture("launch-failure");
+    const result =
+      operation === "capture"
+        ? await f.service.inspect({ path: f.path, fields: ["ip.addr"] })
+        : await f.service.inspectFields({ kind: "fields" });
+    if (result.ok) throw new Error("Expected launch failure");
+    expect(f.calls()).toBe(2);
+    expect(result.error.message).toContain("spawn E2BIG");
+    expect(result.error.capturedOutput).toBeUndefined();
   },
 );
 
@@ -307,7 +331,7 @@ it("retains a completed observation when cancellation arrives at the service bou
       throw new Error("Unexpected field discovery call");
     },
     inspect: async () => {
-      f.controller.abort();
+      f.controller.abort({ request: "cancel at Evidence boundary" });
       return execution;
     },
     close: async () => {},
@@ -315,6 +339,7 @@ it("retains a completed observation when cancellation arrives at the service bou
   const result = await service.inspect(input, { signal: f.controller.signal });
   if (result.ok) throw new Error("Expected late cancellation");
   expect(result.error._tag).toBe("AnalysisCancelledError");
+  expect(result.error.cause).toBe(f.controller.signal.reason);
   expect(result.error.partialObservation).toMatchObject({
     operation: "inspect_packet_capture",
     normalized_result: {
@@ -625,3 +650,67 @@ it("retains completed discovery on late cancellation and cleanup failure", async
     await f.service.close();
   }
 });
+
+it("preserves discovery resource ownership through CLI shutdown retries", async () => {
+  const f = await fixture("cleanup", true);
+  const cli = Cli.create("discovery-cleanup", { sync: false });
+  registerCaptureCommands(cli, silentLogger, {}, f.service);
+  let stdout = "";
+  try {
+    await cli.serve(
+      ["inspect-packet-fields", "--query", "usb", "--format", "json"],
+      {
+        stdout: (text) => {
+          stdout += text;
+        },
+        exit: () => {},
+      },
+    );
+    expect(JSON.parse(stdout)).toMatchObject({
+      code: "cleanup_incomplete",
+      details: {
+        diagnostics: {
+          cleanup_error: {
+            details: { operation: "inspect_packet_fields" },
+          },
+        },
+      },
+    });
+  } finally {
+    f.allowCleanup();
+    await f.service.close();
+  }
+});
+
+it.each(
+  [false, true].flatMap((failsClose) =>
+    [false, true].map((discovery) => ({ failsClose, discovery })),
+  ),
+)(
+  "retains completed Evidence and exact cancellation during workspace close: %j",
+  async ({ failsClose, discovery }) => {
+    const f = await fixture("close-abort", failsClose);
+    const result = discovery
+      ? await f.service.inspectFields({}, { signal: f.controller.signal })
+      : await f.service.inspect(
+          { path: f.path, fields: ["ip.addr"] },
+          { signal: f.controller.signal },
+        );
+    if (result.ok) throw new Error("Expected finalization cancellation");
+    const primary = failsClose ? result.error.cleanupPrimary : result.error;
+    expect(primary).toMatchObject({ _tag: "AnalysisCancelledError" });
+    expect(primary?.cause).toBe(f.controller.signal.reason);
+    expect(result.error.partialObservation).toMatchObject({
+      operation: discovery ? "inspect_packet_fields" : "inspect_packet_capture",
+    });
+    expect(result.error.cleanupIncomplete).toBe(failsClose);
+    if (failsClose)
+      await expect(f.service.close()).rejects.toMatchObject({
+        cleanupIncomplete: true,
+      });
+    f.allowCleanup();
+    await f.service.close();
+    expect(result.error.cleanupIncomplete).toBe(false);
+    expect(primary?.cause).toBe(f.controller.signal.reason);
+  },
+);

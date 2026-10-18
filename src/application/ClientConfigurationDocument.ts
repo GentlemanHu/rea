@@ -1,9 +1,4 @@
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
-import {
-  parse as parseYaml,
-  parseDocument as parseYamlDocument,
-  stringify as stringifyYaml,
-} from "yaml";
 import { isDeepStrictEqual } from "node:util";
 
 import {
@@ -13,13 +8,20 @@ import {
   dshClientRegistrationEntry,
 } from "./DshCordisPatch.js";
 import {
+  editHermesConfigurationYaml,
+  parseHermesConfigurationYaml,
+  stringifyHermesConfigurationYaml,
+} from "./HermesConfigurationYaml.js";
+import {
   applyEdits,
+  createScanner,
   findNodeAtLocation,
   modify,
   parse as parseJsonc,
   parseTree,
   printParseErrorCode,
   type ParseError,
+  type SyntaxKind,
 } from "jsonc-parser";
 import { z } from "zod";
 
@@ -102,26 +104,67 @@ export const clientConfigurationServersKey = (
 const isEmptyClientConfigurationText = (text: string): boolean =>
   text.replace(/^\uFEFF/, "").trim() === "";
 
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+/**
+ * Parse client TOML with TOML 1.0's signed 64-bit integer contract. Integers
+ * beyond JavaScript's safe range stay exact as bigint; values outside Int64,
+ * which Codex rejects, are malformed.
+ */
+const parseClientToml = (text: string): Record<string, unknown> => {
+  const parsed = parseToml(text, { integersAsBigInt: "asNeeded" });
+  const pending: unknown[] = [parsed];
+  for (let value = pending.pop(); value !== undefined; value = pending.pop()) {
+    if (typeof value === "bigint") {
+      if (value < INT64_MIN || value > INT64_MAX)
+        throw new SyntaxError(
+          `Invalid TOML document: integer ${String(value)} is outside the signed 64-bit range`,
+        );
+    } else if (
+      typeof value === "object" &&
+      value !== null &&
+      !(value instanceof Date)
+    )
+      // Large documents can exceed argument limits, so do not spread.
+      for (const nested of Object.values(value)) pending.push(nested);
+  }
+  return parsed;
+};
+
 const parseDocument = (
   text: string,
   format: ClientConfigurationFormat,
 ): Record<string, unknown> => {
   if (format === "toml" || format === "grok")
-    return requireObject(parseToml(text), "The configuration root");
+    return requireObject(parseClientToml(text), "The configuration root");
   // Pi loads `mcp.json` with a strict `JSON.parse` and no BOM tolerance, so
   // comments, trailing commas, a BOM, or an empty existing file must be
-  // rejected instead of registering into a document Pi cannot load.
-  if (format === "pi")
+  // rejected instead of registering into a document the client cannot load.
+  // Kimi also reads mcp.json with JSON.parse and an empty-file fallback.
+  if (format === "pi" || format === "kimi") {
+    if (format === "kimi" && text.trim().length === 0) return {};
     return requireObject(JSON.parse(text), "The configuration root");
+  }
   // An empty file, which some clients create before any server is added,
   // holds no settings to preserve.
   if (isEmptyClientConfigurationText(text)) return {};
   // Hermes stores MCP servers in `mcp_servers` inside a YAML document.
   if (format === "hermes")
-    return requireObject(parseYaml(text), "The configuration root");
+    return requireObject(
+      parseHermesConfigurationYaml(text),
+      "The configuration root",
+    );
   // ZCode loads nonempty native files with strict JSON.parse.
   if (format === "zcode")
     return requireObject(JSON.parse(text), "The configuration root");
+  // Claude Code loads `.claude.json` with strict JSON.parse after a UTF-8 BOM,
+  // so comments and trailing commas it rejects must not be admitted as JSONC.
+  if (format === "claude_code")
+    return requireObject(
+      JSON.parse(text.replace(/^\uFEFF/, "")),
+      "The configuration root",
+    );
   const errors: ParseError[] = [];
   // Accept a UTF-8 BOM without shifting diagnostics or editing the original text.
   const jsonText = text.startsWith("\uFEFF") ? ` ${text.slice(1)}` : text;
@@ -161,7 +204,7 @@ export const parseZcodeFallbackConfiguration = (
         ? {}
         : requireObject(document.mcpServers, "ZCode fallback mcpServers"),
     serversPath: ["mcpServers"],
-    dialect: "json",
+    dialect: "zcode_fallback",
     legacyServers: {},
   };
 };
@@ -177,6 +220,7 @@ export const parseClientConfiguration = (
   if (format === undefined || format === "unsupported")
     throw new TypeError("client does not have a supported MCP config format");
   // DeepSeek Harness stores a Cordis patch list, not a server table.
+  if (format === "zcode_fallback") return parseZcodeFallbackConfiguration(text);
   if (format === "dsh") return parseDshCordisDocument(text);
   const document = parseDocument(text, format);
   const serversKey = clientConfigurationServersKey(format);
@@ -637,6 +681,7 @@ const tomlInlineValue = (value: unknown): string => {
   if (typeof value === "string") return tomlBasicString(value);
   if (typeof value === "boolean") return value ? "true" : "false";
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "bigint") return String(value);
   if (Array.isArray(value))
     return `[${value.map((item) => tomlInlineValue(item)).join(", ")}]`;
   if (typeof value === "object" && value !== null) {
@@ -808,7 +853,7 @@ const rebuildDelimitedEntries = (
  */
 const tomlStringValue = (text: string): string | undefined => {
   try {
-    const value = parseToml(`value = ${text}`)["value"];
+    const value = parseClientToml(`value = ${text}`)["value"];
     return typeof value === "string" ? value : undefined;
   } catch (cause: unknown) {
     void cause;
@@ -922,6 +967,13 @@ const disabledServerListLines = (
   }
 };
 
+/** Strip terminal LF without rescanning internal blank-line runs. */
+const withoutTrailingLineFeeds = (text: string): string => {
+  let end = text.length;
+  while (end > 0 && text.charCodeAt(end - 1) === 10) end -= 1;
+  return text.slice(0, end);
+};
+
 /**
  * Replace REA's TOML server tables and assignments. Comments that introduce a
  * following table stay. Codex also retains comments around REA's own table.
@@ -958,15 +1010,13 @@ const upsertTomlServerSection = (
   const discardPending = (): void => {
     pending.length = 0;
   };
-  const flushPending = (): void => {
-    kept.push(...pending);
-    pending.length = 0;
+  // Document line counts must not become engine-limited argument counts.
+  const appendLines = (lines: readonly string[]): void => {
+    for (const line of lines) kept.push(line);
   };
-  const lineIndexAt = (offset: number): number => {
-    let line = 0;
-    for (let index = 0; index < lineStarts.length; index += 1)
-      if ((lineStarts[index] ?? 0) <= offset) line = index;
-    return line;
+  const flushPending = (): void => {
+    appendLines(pending);
+    pending.length = 0;
   };
   let lineIndex = 0;
   while (lineIndex < lines.length) {
@@ -1002,7 +1052,14 @@ const upsertTomlServerSection = (
       let statementEnd = valueEnd;
       while (statementEnd < text.length && text[statementEnd] !== "\n")
         statementEnd += 1;
-      const endLine = lineIndexAt(Math.max(statementEnd - 1, lineStart));
+      const lastOffset = Math.max(statementEnd - 1, lineStart);
+      let endLine = lineIndex;
+      // Statements advance through the source; only inspect their own lines.
+      while (
+        endLine + 1 < lineStarts.length &&
+        (lineStarts[endLine + 1] ?? 0) <= lastOffset
+      )
+        endLine += 1;
       if (skipping) {
         discardPending();
         lineIndex = endLine + 1;
@@ -1030,7 +1087,7 @@ const upsertTomlServerSection = (
           : undefined;
       if (disabledLines !== undefined) {
         flushPending();
-        kept.push(...disabledLines);
+        appendLines(disabledLines);
         lineIndex = endLine + 1;
         mode = "none";
         continue;
@@ -1055,7 +1112,7 @@ const upsertTomlServerSection = (
             edited === undefined
               ? text.slice(lineStart, statementEnd)
               : `${prefix}${edited}${suffix}`;
-          kept.push(...replacement.split("\n"));
+          appendLines(replacement.split("\n"));
           inlineServerTable = true;
         } else discardPending();
       } else {
@@ -1094,13 +1151,13 @@ const upsertTomlServerSection = (
   // The last kept CRLF line has no following LF from the join.
   if (body.endsWith("\r")) body += "\n";
   if (entry !== undefined && !inlineServerTable) {
-    let fragment = stringifyToml({
-      mcp_servers: { [serverKey]: entry },
-    }).replace(/\n+$/u, "");
+    let fragment = withoutTrailingLineFeeds(
+      stringifyToml({ mcp_servers: { [serverKey]: entry } }),
+    );
     if (crlf) fragment = fragment.replaceAll("\n", "\r\n");
     const nl = crlf ? "\r\n" : "\n";
     const endedWithNewline = body.endsWith("\n");
-    const base = body.replace(/\n+$/u, "");
+    const base = withoutTrailingLineFeeds(body);
     const trimmed =
       endedWithNewline && base.endsWith("\r") ? base.slice(0, -1) : base;
     body =
@@ -1230,7 +1287,7 @@ const tomlTextHolds = (
 ): boolean => {
   try {
     return clientConfigurationValuesEqual(
-      withoutEmptyServerTable(objectSchema.parse(parseToml(text))),
+      withoutEmptyServerTable(objectSchema.parse(parseClientToml(text))),
       withoutEmptyServerTable(document),
     );
   } catch (cause: unknown) {
@@ -1240,44 +1297,27 @@ const tomlTextHolds = (
   }
 };
 
-/** Comments in the trivia between two properties. `undefined` when there are none. */
-const commentsBetweenProperties = (gap: string): string | undefined => {
-  const pieces: string[] = [];
-  let index = 0;
-  while (index < gap.length) {
-    const line = gap.indexOf("//", index);
-    const block = gap.indexOf("/*", index);
-    if (line < 0 && block < 0) break;
-    const start = line < 0 ? block : block < 0 ? line : Math.min(line, block);
-    const lineComment = start === line;
-    const close = lineComment
-      ? gap.indexOf("\n", start)
-      : gap.indexOf("*/", start + 2);
-    if (!lineComment && close < 0) return undefined;
-    const end = lineComment ? (close < 0 ? gap.length : close) : close + 2;
-    const comment = gap.slice(start, end);
-    const lineBreak = gap.lastIndexOf("\n", start - 1);
-    if (lineBreak < 0) pieces.push(` ${comment}`);
-    else {
-      const prefix = gap.slice(lineBreak + 1, start);
-      let indentEnd = 0;
-      while (prefix[indentEnd] === " " || prefix[indentEnd] === "\t")
-        indentEnd += 1;
-      const newline =
-        lineBreak > 0 && gap[lineBreak - 1] === "\r" ? "\r\n" : "\n";
-      pieces.push(`${newline}${prefix.slice(0, indentEnd)}${comment}`);
-    }
-    index = end;
-  }
-  return pieces.length === 0 ? undefined : pieces.join("");
+// jsonc-parser declares SyntaxKind as an ambient const enum, so keep its token
+// code local and type-checked as in the JSON scanner used by IDA diagnostics.
+const JSON_COMMA = 5 satisfies SyntaxKind;
+
+/** Find the next non-trivia JSONC token at or after `offset`. */
+const nextJsoncToken = (
+  text: string,
+  offset: number,
+): { readonly kind: SyntaxKind; readonly offset: number } => {
+  const scanner = createScanner(text, true);
+  scanner.setPosition(offset);
+  const kind = scanner.scan();
+  return { kind, offset: scanner.getTokenOffset() };
 };
 
 /**
- * Delete an object property without taking a comment from the gap before it.
- * jsonc-parser's removal span includes that gap, so a trailing comment on the
- * previous property would disappear. Returns `undefined` to keep the stock edit.
+ * Delete a property by its JSONC AST span and the separator needed to keep its
+ * parent object valid. All whitespace and comments outside those tokens stay
+ * byte-for-byte in place.
  */
-const deleteJsonPropertyPreservingComments = (
+const deleteJsonProperty = (
   text: string,
   path: readonly string[],
 ): string | undefined => {
@@ -1294,54 +1334,26 @@ const deleteJsonPropertyPreservingComments = (
   )
     return undefined;
   const propertyIndex = parent.children.indexOf(property);
+  if (propertyIndex < 0) return undefined;
   const previous = parent.children[propertyIndex - 1];
-  if (propertyIndex <= 0 || previous === undefined) return undefined;
-  const comments = commentsBetweenProperties(
-    text.slice(previous.offset + previous.length, property.offset),
-  );
-  if (comments === undefined) return undefined;
-  let removeEnd = property.offset + property.length;
-  const hasNext = parent.children[propertyIndex + 1] !== undefined;
-  if (hasNext) {
-    let comma = removeEnd;
-    while (comma < text.length) {
-      const char = text[comma];
-      if (char === " " || char === "\t" || char === "\r" || char === "\n") {
-        comma += 1;
-        continue;
-      }
-      if (text.startsWith("/*", comma)) {
-        const close = text.indexOf("*/", comma + 2);
-        if (close < 0) return undefined;
-        comma = close + 2;
-        continue;
-      }
-      if (text.startsWith("//", comma)) {
-        while (
-          comma < text.length &&
-          text[comma] !== "\n" &&
-          text[comma] !== "\r"
-        )
-          comma += 1;
-        continue;
-      }
-      break;
-    }
-    if (text[comma] !== ",") return undefined;
-    removeEnd = comma + 1;
+  const next = parent.children[propertyIndex + 1];
+  let commaOffset: number | undefined;
+  if (previous !== undefined) {
+    const comma = nextJsoncToken(text, previous.offset + previous.length);
+    if (comma.kind !== JSON_COMMA) return undefined;
+    commaOffset = comma.offset;
+  } else {
+    const token = nextJsoncToken(text, property.offset + property.length);
+    if (token.kind === JSON_COMMA) commaOffset = token.offset;
+    else if (next !== undefined) return undefined;
   }
-  // A line comment runs to the next break. Keep the following token outside it.
-  const remainder = text.slice(removeEnd);
-  let suffix = `${hasNext ? "," : ""}${comments}`;
-  if (
-    suffix.includes("//") &&
-    !suffix.endsWith("\n") &&
-    !suffix.endsWith("\r") &&
-    !remainder.startsWith("\n") &&
-    !remainder.startsWith("\r")
-  )
-    suffix += "\n";
-  return `${text.slice(0, previous.offset + previous.length)}${suffix}${remainder}`;
+  const edits = [
+    { offset: property.offset, length: property.length, content: "" },
+    ...(commaOffset === undefined
+      ? []
+      : [{ offset: commaOffset, length: 1, content: "" }]),
+  ];
+  return applyEdits(text, edits);
 };
 
 /** Serialize a validated client document, retaining JSONC and TOML comments. */
@@ -1370,7 +1382,7 @@ export const serializeClientConfiguration = (
     return editedPaths.reduce((text, path) => {
       const value = valueAt(document, path);
       if (value === undefined) {
-        const preserved = deleteJsonPropertyPreservingComments(text, path);
+        const preserved = deleteJsonProperty(text, path);
         if (preserved !== undefined) return preserved;
       }
       return applyEdits(
@@ -1412,19 +1424,18 @@ const serializeHermesConfiguration = (
     originalText === undefined ||
     isEmptyClientConfigurationText(originalText)
   )
-    return stringifyYaml(document);
+    return stringifyHermesConfigurationYaml(document);
   const serversKey = clientConfigurationServersKey("hermes");
   const servers = document[serversKey];
   const entry =
     typeof servers === "object" && servers !== null
       ? (servers as Record<string, unknown>)[PRODUCT_IDENTITY.mcpServerKey]
       : undefined;
-  const yamlDocument = parseYamlDocument(originalText);
-  if (entry === undefined)
-    yamlDocument.deleteIn([serversKey, PRODUCT_IDENTITY.mcpServerKey]);
-  else yamlDocument.setIn([serversKey, PRODUCT_IDENTITY.mcpServerKey], entry);
-  // Editing REA must not reflow unrelated user prompts or other YAML scalars.
-  return yamlDocument.toString({ lineWidth: 0 });
+  return editHermesConfigurationYaml(
+    originalText,
+    [serversKey, PRODUCT_IDENTITY.mcpServerKey],
+    entry,
+  );
 };
 
 /** Build the stdio entry shape expected by one client's configuration dialect. */
@@ -1443,6 +1454,13 @@ export const clientRegistrationEntry = (
         ...(Object.keys(environment).length === 0
           ? {}
           : { environment: { ...environment } }),
+      };
+    case "kimi":
+      // Kimi infers stdio from command; it uses `transport`, not `type`.
+      return {
+        command: executable,
+        args,
+        ...(Object.keys(environment).length === 0 ? {} : { env: environment }),
       };
     case "opencode_v2":
       // V2 connects servers unless `disabled` is true.
@@ -1508,12 +1526,25 @@ export const parseGeminiMcpPolicy = (parsed: ClientConfigurationDocument) =>
     .passthrough()
     .parse(parsed.document.mcp ?? {});
 
+/** One server-name comparison for the exclusion, intersection and membership rules below. */
+const normalizeGeminiServerName = (name: string): string =>
+  name.toLowerCase().trim();
+
 /** Gemini consolidates excludes by union and allowlists by normalized intersection. */
 export const geminiServerPolicyBlock = (
   policies: readonly ReturnType<typeof parseGeminiMcpPolicy>[],
   serverKey: string,
 ): string | undefined => {
-  if (policies.some(({ excluded }) => excluded?.includes(serverKey)))
+  // Hand-authored settings cannot be assumed to spell the product key exactly,
+  // so every rule compares normalized names. Testing the consolidated list
+  // against the raw key instead would make the outcome depend on which policy
+  // supplied the spelling that survived the intersection.
+  const key = normalizeGeminiServerName(serverKey);
+  if (
+    policies.some(({ excluded }) =>
+      excluded?.some((name) => normalizeGeminiServerName(name) === key),
+    )
+  )
     return `Gemini mcp.excluded blocks ${serverKey}. Review the selected settings policies before rerunning setup.`;
   const allowlists = policies.flatMap(({ allowed }) =>
     allowed === undefined ? [] : [allowed],
@@ -1521,11 +1552,9 @@ export const geminiServerPolicyBlock = (
   const allowed = allowlists.reduce<string[] | undefined>(
     (previous, current) => {
       if (previous === undefined) return current;
-      const normalized = new Set(
-        current.map((name) => name.toLowerCase().trim()),
-      );
+      const normalized = new Set(current.map(normalizeGeminiServerName));
       return previous.filter((name) =>
-        normalized.has(name.toLowerCase().trim()),
+        normalized.has(normalizeGeminiServerName(name)),
       );
     },
     undefined,
@@ -1534,7 +1563,7 @@ export const geminiServerPolicyBlock = (
   if (
     allowed !== undefined &&
     allowed.length > 0 &&
-    !allowed.includes(serverKey)
+    !allowed.some((name) => normalizeGeminiServerName(name) === key)
   )
     return `Gemini mcp.allowed does not include ${serverKey}. Review the selected settings policies before rerunning setup.`;
   return undefined;

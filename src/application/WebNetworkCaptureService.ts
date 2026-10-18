@@ -20,12 +20,18 @@ import {
   captureSensitiveValues,
   webNetworkCaptureSchema,
 } from "../domain/webNetworkCapture.js";
+import { completeProviderEvidence } from "./ProviderOperationExecution.js";
 
 const OPERATION = "inspect_web_network_capture";
 
 /** Shared CLI/MCP historical inspection preserves caller selection and producer record identity. */
 export class WebNetworkCaptureService {
   constructor(readonly port: WebNetworkCapturePort) {}
+
+  /** Release resources retained by the selected capture adapter. */
+  close(): Promise<void> {
+    return this.port.close?.() ?? Promise.resolve();
+  }
 
   /** Return selected complete records inline, without inventing live browser attribution. */
   async inspect(
@@ -69,8 +75,6 @@ export class WebNetworkCaptureService {
       );
     const loaded = await this.port.inspect(input, options);
     if (!loaded.ok) return failure(loaded.error);
-    if (options?.signal?.aborted)
-      return failure(new AnalysisCancelledError(OPERATION));
     const report = webNetworkCaptureSchema.safeParse(loaded.value);
     if (!report.success)
       return failure(
@@ -154,7 +158,7 @@ export class WebNetworkCaptureService {
       record_ordinals: selected,
       sensitive_value_count: input.sensitive_values.length,
     });
-    return ok(
+    return completeProviderEvidence(
       createEvidence(
         safeSha256 === null
           ? undefined
@@ -169,7 +173,11 @@ export class WebNetworkCaptureService {
           parameters,
           result: {
             ...safeValue,
-            artifact: { ...value.artifact, path: safePath, sha256: safeSha256 },
+            artifact: {
+              ...value.artifact,
+              path: safePath,
+              sha256: safeSha256,
+            },
             records,
             limitations:
               safeSha256 === null
@@ -193,6 +201,7 @@ export class WebNetworkCaptureService {
             safePath === "" ? [] : [{ kind: "artifact-path", path: safePath }],
         },
       ),
+      options?.signal,
     );
   }
 }

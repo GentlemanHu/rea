@@ -1,3 +1,4 @@
+import { artifactFileCancellationCause } from "../artifacts/ArtifactFileOperation.js";
 import {
   type InspectSignalDecodersInput,
   signalDecodersSchema,
@@ -7,6 +8,8 @@ import {
   parseDecoderDiscovery,
 } from "./parseDecoderDiscovery.js";
 import {
+  BOUNDED_PRODUCER_LIMITS as LIMITS,
+  prlimitArgumentVector,
   readLinuxResourceLimits,
   type LinuxResourceLimits,
 } from "../process/LinuxResourceLimits.js";
@@ -58,15 +61,6 @@ export const SIGROK_PROVIDER_IDENTITY = {
   id: "sigrok-recording",
   name: "REA sigrok recording adapter",
   version: "sigrok-cli@0.7.2",
-} as const;
-// Bound the resident input copy and retained text before allocation/collection.
-const LIMITS = {
-  input_bytes: 32 * 1024 * 1024,
-  output_bytes: 4 * 1024 * 1024,
-  command_timeout_ms: 30_000,
-  address_space_bytes: 1024 * 1024 * 1024,
-  file_bytes: 64 * 1024 * 1024,
-  cpu_seconds: 30,
 } as const;
 type Launcher = NonNullable<Parameters<typeof runOwnedCommand>[2]>["launcher"];
 
@@ -133,7 +127,10 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
     let root: ArtifactAnalysisRuntime | undefined;
     let result: Result<AnalysisExecution, AnalysisError>;
     try {
-      if (options?.signal?.aborted) throw new AnalysisCancelledError(operation);
+      if (options?.signal?.aborted)
+        throw new AnalysisCancelledError(operation, {
+          cause: options.signal.reason,
+        });
       await this.#resources.release();
       if (this.platform !== "linux")
         throw new Error(
@@ -163,19 +160,13 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
         options?.signal,
       );
       effectiveLimits = await this.#resources.readLimits(LIMITS);
-      const limitArguments = [
-        `--as=${effectiveLimits.address_space_bytes}:${effectiveLimits.address_space_bytes}`,
-        `--fsize=${effectiveLimits.file_bytes}:${effectiveLimits.file_bytes}`,
-        `--cpu=${effectiveLimits.cpu_seconds}:${effectiveLimits.cpu_seconds}`,
-        "--core=0:0",
-        "--",
-        command,
-      ];
+      const limitArguments = prlimitArgumentVector(effectiveLimits, command);
       phase = "workspace";
       root = await this.createRuntime();
-      this.#resources.retain(root, undefined, operation);
+      this.#resources.retain(root, undefined);
       const snapshotPath = join(root.path, "recording");
       const execute = async (args: readonly string[]) => {
+        capturedOutput = undefined;
         const output = await runOwnedCommand(
           {
             command: limiter,
@@ -371,7 +362,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
         cause instanceof OwnedCommandFailure &&
         cause.cleanupOwner !== undefined
       )
-        this.#resources.retain(root, cause.cleanupOwner, operation);
+        this.#resources.retain(root, cause.cleanupOwner);
       result = err(
         this.#failure(
           cause,
@@ -396,6 +387,7 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
           limitations: execution.limitations,
         }),
       operation,
+      options?.signal,
     );
   }
   #failure(
@@ -415,16 +407,27 @@ export class SigrokRecordingProvider implements SignalRecordingPort {
     if (cause instanceof AnalysisError) return cause;
     if (cause instanceof ArtifactReaderFailure && cause.cleanup !== undefined)
       return this.#resources.cleanupFailure(
-        cause.cleanup,
         cause,
+        (primary) =>
+          this.#failure(
+            primary,
+            phase,
+            path,
+            workspacePath,
+            effectiveLimits,
+            observedOutput,
+            operation,
+          ),
         observedOutput,
         operation,
       );
-    if (
-      (cause instanceof Error && cause.name === "AbortError") ||
-      (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
-    )
-      return new AnalysisCancelledError(operation, { cause });
+    if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+      return new AnalysisCancelledError(operation, {
+        cause: artifactFileCancellationCause(cause),
+        ...(observedOutput === undefined
+          ? {}
+          : { capturedOutput: observedOutput }),
+      });
     if (cause instanceof DecoderDiscoveryBudgetError)
       return new AnalysisResourceConstraintError(
         operation,

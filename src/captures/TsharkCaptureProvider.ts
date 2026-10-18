@@ -1,3 +1,4 @@
+import { artifactFileCancellationCause } from "../artifacts/ArtifactFileOperation.js";
 import {
   type InspectPacketFieldsInput,
   packetFieldsCatalogSchema,
@@ -8,6 +9,8 @@ import {
   FIELD_RECORD_BUDGET,
 } from "./parseFieldDiscovery.js";
 import {
+  BOUNDED_PRODUCER_LIMITS as LIMITS,
+  prlimitArgumentVector,
   readLinuxResourceLimits,
   type LinuxResourceLimits,
 } from "../process/LinuxResourceLimits.js";
@@ -59,15 +62,6 @@ export const TSHARK_PROVIDER_IDENTITY = {
   id: "tshark-capture",
   name: "REA TShark capture adapter",
   version: "tshark@4",
-} as const;
-// Bound the resident input copy and retained text before allocation/collection.
-const LIMITS = {
-  input_bytes: 32 * 1024 * 1024,
-  output_bytes: 4 * 1024 * 1024,
-  command_timeout_ms: 30_000,
-  address_space_bytes: 1024 * 1024 * 1024,
-  file_bytes: 64 * 1024 * 1024,
-  cpu_seconds: 30,
 } as const;
 type Launcher = NonNullable<Parameters<typeof runOwnedCommand>[2]>["launcher"];
 
@@ -137,7 +131,10 @@ export class TsharkCaptureProvider implements PacketCapturePort {
     let root: ArtifactAnalysisRuntime | undefined;
     let result: Result<AnalysisExecution, AnalysisError>;
     try {
-      if (options?.signal?.aborted) throw new AnalysisCancelledError(operation);
+      if (options?.signal?.aborted)
+        throw new AnalysisCancelledError(operation, {
+          cause: options.signal.reason,
+        });
       await this.#resources.release();
       if (this.platform !== "linux")
         throw new Error(
@@ -165,21 +162,15 @@ export class TsharkCaptureProvider implements PacketCapturePort {
         options?.signal,
       );
       effectiveLimits = await this.#resources.readLimits(limits);
-      const limitArguments = [
-        `--as=${effectiveLimits.address_space_bytes}:${effectiveLimits.address_space_bytes}`,
-        `--fsize=${effectiveLimits.file_bytes}:${effectiveLimits.file_bytes}`,
-        `--cpu=${effectiveLimits.cpu_seconds}:${effectiveLimits.cpu_seconds}`,
-        "--core=0:0",
-        "--",
-        command,
-      ];
+      const limitArguments = prlimitArgumentVector(effectiveLimits, command);
       phase = "workspace";
       root = await this.createRuntime();
-      this.#resources.retain(root, undefined, operation);
+      this.#resources.retain(root, undefined);
       const snapshotPath = join(root.path, "capture");
       const configurationPath = join(root.path, "configuration");
       await mkdir(configurationPath, { mode: 0o700 });
       const execute = async (args: readonly string[]) => {
+        capturedOutput = undefined;
         const output = await runOwnedCommand(
           {
             command: limiter,
@@ -406,7 +397,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
         cause instanceof OwnedCommandFailure &&
         cause.cleanupOwner !== undefined
       )
-        this.#resources.retain(root, cause.cleanupOwner, operation);
+        this.#resources.retain(root, cause.cleanupOwner);
       result = err(
         this.#failure(
           cause,
@@ -432,6 +423,7 @@ export class TsharkCaptureProvider implements PacketCapturePort {
           limitations: execution.limitations,
         }),
       operation,
+      options?.signal,
     );
   }
   #failure(
@@ -455,16 +447,28 @@ export class TsharkCaptureProvider implements PacketCapturePort {
     if (cause instanceof AnalysisError) return cause;
     if (cause instanceof ArtifactReaderFailure && cause.cleanup !== undefined)
       return this.#resources.cleanupFailure(
-        cause.cleanup,
         cause,
+        (primary) =>
+          this.#failure(
+            primary,
+            phase,
+            path,
+            workspacePath,
+            effectiveLimits,
+            observedOutput,
+            operation,
+            limits,
+          ),
         observedOutput,
         operation,
       );
-    if (
-      (cause instanceof Error && cause.name === "AbortError") ||
-      (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
-    )
-      return new AnalysisCancelledError(operation, { cause });
+    if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+      return new AnalysisCancelledError(operation, {
+        cause: artifactFileCancellationCause(cause),
+        ...(observedOutput === undefined
+          ? {}
+          : { capturedOutput: observedOutput }),
+      });
     if (cause instanceof FieldDiscoveryBudgetError)
       return new AnalysisResourceConstraintError(
         operation,
